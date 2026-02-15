@@ -1,0 +1,720 @@
+RMER REIMPLEMENTATION: FULL PROJECT SUMMARY (CODE, FIXES, RESULTS)
+=================================================================
+
+This text file is a single, self-contained overview of the entire RMER
+reimplementation project as it exists now: model, components, training
+setup, bugs found and fixed, experiments, results (old and new), and
+file structure.
+
+
+1. PROJECT OVERVIEW
+-------------------
+
+Goal: Reimplement and rigorously evaluate RMER (Regret Minimization
+Experience Replay) for off-policy RL, focusing on DQN in LunarLander-v2
+and a few other classic-control tasks.
+
+High level:
+
+- Baseline: standard DQN with uniform replay.
+- RMER: regret-minimizing replay that prioritizes transitions by:
+
+    priority(s, a) = on_policy_weight(s, a) × accuracy_score(s, a) × |hindsight_TD(s, a)|
+
+  where:
+  - Hindsight TD (HTD): TD error computed after a gradient update
+    (Q_k, not Q_{k-1}).
+  - LFIW: Learned on-policy weight from a classifier that separates
+    recent (fast) vs older (slow) transitions.
+  - TCE: Temporal Consistency Error, giving a Q-accuracy score based
+    on distance to terminal states and moving-average Bellman error.
+
+The project is organized into three phases:
+
+- Phase 1: Baseline DQN implementation and training.
+- Phase 2: Individual RMER components (HTD, LFIW, TCE) with tests.
+- Phase 3: Full RMER integration (RMERBuffer, RMERAgent, trainer, and
+  experiment scripts).
+
+
+2. FILE STRUCTURE (ACTUAL REPO)
+-------------------------------
+
+Top-level (key files only):
+
+- README.md
+  - Main project documentation, theory, and usage.
+
+- requirements.txt
+  - Python dependencies (PyTorch, Gymnasium, etc.).
+
+- config.py
+  - Central configuration:
+    - BASELINE_CONFIG: buffer_size=100_000, batch_size=64,
+      total_steps=200_000, learning_starts=1000, train_freq=4,
+      log_freq=1000, eval_freq=10000, eval_episodes=10, save_freq=50000,
+      hidden_dims=[128, 128], relu activation, lr=2.5e-4, gamma=0.99,
+      tau=0.005, epsilon_start=1.0, epsilon_end=0.05,
+      epsilon_decay_steps=20_000 (env steps).
+    - HINDSIGHT_TD_CONFIG: clip_td_error=10.0.
+    - LFIW_CONFIG: classifier_hidden_dim=64, lr=1e-3, temperature=10.0,
+      fast_buffer_ratio=0.2, classifier_update_freq=4,
+      min_samples_for_training=2000.
+    - TCE_CONFIG: gamma=0.99, c_max_suboptimality=0.1,
+      b1: 0.4→0.9, b2: 1.6→1.1, moving_avg_window=1000,
+      moving_avg_momentum=0.99.
+    - RMER_CONFIG: BASELINE_CONFIG + use_hindsight_td=True,
+      use_lfiw=True, use_tce=True, priority_epsilon=1e-6,
+      priority_clip_max=5.0, priority_temperature=1.0.
+    - ABLATION_CONFIGS: uniform, td_only, lfiw_only, tce_only,
+      td_lfiw, td_tce, lfiw_tce, full_rmer flags.
+
+- DEEP_ANALYSIS_EPSILON_AND_RESULTS.md
+  - Deep root-cause analysis of the epsilon-decay bug and its effect
+    on early vs late seeds, plus before/after results.
+
+- RESEARCH_CONTRIBUTIONS.md
+  - High-level research / scientific contributions and main empirical
+    findings (null result for RMER vs TD-only under fixed config).
+
+- INFORMATION_CHECKLIST.md
+  - Run timestamps, epsilon curves, config history, and recommended
+    re-run plan (re-run all seeds 0–9 under fixed code).
+
+- AUDIT_REMAINING_ISSUES.md
+  - Detailed audit of non-epsilon bugs (buffer/TCE/etc.) and the fixes
+    we implemented.
+
+- td_only_results.json, full_rmer_results.json
+  - Scalar summary results (per-seed final eval returns) for TD-only
+    and full RMER after the epsilon fix.
+
+- ALMOST_THERE_BALANCE.md
+  - Earlier statistical analysis explaining why unbalanced seeds (5 vs
+    10) had low power and recommending a balanced 10 vs 10 setup.
+
+- fixed/
+  - Output directory for new “fixed logic” experiments (td_only and
+    full_rmer, seeds 0–9, 200k steps).
+
+- results/
+  - Previous ablation and comparison runs, JSON files and plots:
+    - ablation_LunarLander-v2_.../ablation_results.json
+    - comparison_* directories for various envs with learning curves
+      and tables.
+
+- runs/, runs_archive_invalid/
+  - TensorBoard logs.
+  - runs_archive_invalid contains the *old, invalid* RMER runs
+    (epsilon bug) for record-keeping.
+
+- experiments/
+  - run_ablations.py: ablation over all 8 configs.
+  - compare_methods.py: compares methods (e.g. uniform vs RMER) and
+    saves results under results/.
+  - run_fixed_experiments.py: new script orchestrating full 200k-step,
+    10-seed td_only + full_rmer runs under fixed logic into fixed/.
+
+- utils/
+  - evaluation.py: evaluate_agent, compare_agents_statistical, etc.
+  - visualization.py: plotting for ablations and comparisons.
+
+Key subdirectories:
+
+- phase1_baseline/
+  - dqn.py: DQN agent (with fixed epsilon handling now).
+  - replay_buffer.py: (for baseline; RMER uses its own buffer).
+  - train_baseline.py: baseline training script.
+
+- phase2_components/
+  - hindsight_td.py: Hindsight TD computation.
+  - lfiw.py: On-policy classifier and weighting.
+  - tce.py: TCEComputer and DistanceTracker.
+  - test_components.py: component tests / sanity checks.
+
+- phase3_rmer/
+  - rmer_buffer.py: RMERBuffer with HTD, LFIW, TCE, priorities, and
+    (now) circular buffer + correct trans_id mapping.
+  - rmer_agent.py: RMERAgent that wraps a DQNAgent with RMERBuffer.
+  - train_rmer.py: RMERTrainer (training loop, evaluation, plotting,
+    and now output_dir support).
+
+
+3. MODEL AND COMPONENTS
+-----------------------
+
+3.1 Baseline DQN
+
+- Architecture:
+  - Input: observation/state vector.
+  - Hidden: two fully-connected layers, 128 units each, ReLU.
+  - Output: Q-values for each discrete action.
+- Training:
+  - Optimizer: Adam (lr=2.5e-4).
+  - Discount: gamma=0.99.
+  - Target network: soft update tau=0.005.
+  - Batch size: 64.
+  - Replay buffer: capacity 100k, uniform sampling.
+  - Training frequency: every 4 env steps (train_freq=4).
+  - Warmup: learning_starts=1000 steps.
+  - Epsilon-greedy exploration:
+    - epsilon_start=1.0 → epsilon_end=0.05.
+    - epsilon_decay_steps=20_000 env steps after fix.
+
+3.2 RMER: Regret-Minimizing Experience Replay
+
+Priority definition:
+
+  priority(s, a) = w_LFIW(s, a) × accuracy_TCE(s, a) × |HTD(s, a)|
+
+Components:
+
+1) Hindsight TD (HTD)
+   - Compute TD error using Q-values *after* a gradient step:
+     - Temporarily apply a gradient update to the network,
+       compute TD error with updated parameters (Q_k),
+       then restore original parameters.
+   - Intuition: measures how much that transition actually changes Q,
+     aligning with regret minimization.
+   - Config: clip_td_error=10.0 (to avoid huge spikes).
+
+2) LFIW (Learning From Important Weights)
+   - Binary classifier κ(s, a) (OnPolicyClassifier) on concatenated
+     state + one-hot action.
+   - Fast buffer (~20% newest) vs slow buffer (~80% oldest) by age:
+     - Classifier trains to output 1 for fast, 0 for slow.
+   - On-policy weight:
+
+       κ = sigmoid(logits)
+       scaled = κ^(1/T),   T = 10.0
+       w_LFIW = scaled / mean(scaled)
+
+   - Implementation:
+     - LFIWEstimator in phase2_components/lfiw.py.
+     - Update frequency: classifier_update_freq=4.
+     - min_samples_for_training=2000.
+   - With circular buffer, fast vs slow indices are computed using
+     RMERBuffer.get_fast_slow_indices(fast_ratio) so that “fast”
+     really means “most recent in age” even after buffer wrap.
+
+3) TCE (Temporal Consistency Error)
+   - Purpose: estimate Q-accuracy via temporal distance to terminal.
+   - DistanceTracker:
+     - Tracks an integer transition_id for each transition.
+     - Within each episode, stores all transition_ids; at episode end,
+       assigns distances to terminal (h) to each transition_id:
+         - last step: h = 0
+         - previous: h = 1, etc.
+   - TCEComputer (phase2_components/tce.py):
+     - Maintains moving average Bellman error L using exponential
+       moving average over TD errors (from Hindsight TD).
+     - For distance h:
+
+         f(h) = (gamma - gamma^(h+1)) / (1 - gamma)
+         TCE = f(h)*L + c + gamma^(h+1)*c
+         accuracy_TCE = exp(-TCE)
+
+       where c=c_max_suboptimality.
+     - Time-adaptive clipping bounds:
+       - b1: 0.4 → 0.9 over training.
+       - b2: 1.6 → 1.1 over training.
+       - progress = current_step / total_steps (after fix, both are
+         env steps).
+
+
+4. TRAINING PIPELINES
+---------------------
+
+4.1 Baseline DQN Training (Phase 1)
+
+Script: phase1_baseline/train_baseline.py
+
+- CLI:
+
+    python phase1_baseline/train_baseline.py --env LunarLander-v2 --seed 42 --steps 200000
+
+- Loop:
+  - for step in range(total_steps):
+    - agent.decay_epsilon_by_env_step(step)  (fixed)
+    - action = agent.select_action(state)
+    - next_state, reward, done = env.step(action)
+    - push to uniform replay buffer.
+    - if enough transitions and step % train_freq == 0:
+      - sample batch, run DQN update.
+    - log Loss/train, Reward/train, etc., to TensorBoard (runs/).
+    - periodic evaluation over eval_episodes, logged as Reward/eval.
+
+4.2 RMER Training (Phase 3)
+
+Script: phase3_rmer/train_rmer.py, class RMERTrainer.
+
+- CLI (simple example):
+
+    python phase3_rmer/train_rmer.py --env LunarLander-v2 --seed 42 --steps 200000
+
+- Key features:
+  - Uses RMERAgent (DQN + RMERBuffer).
+  - Epsilon is decayed by env step:
+    - self.agent.dqn_agent.decay_epsilon_by_env_step(step).
+  - Each env step:
+    - select_action with current epsilon.
+    - env.step(action).
+    - agent.push(...) to RMERBuffer.
+  - Every train_freq env steps (after learning_starts):
+    - agent.update(env_step=step):
+      - sample batch from RMERBuffer according to priorities.
+      - run DQN update.
+      - compute HTD, LFIW weights, TCE accuracy.
+      - update priorities with product of three components
+        (with percentile and hard clipping).
+      - update LFIW classifier periodically.
+      - step TCEComputer with env_step (for adaptive bounds).
+  - Evaluations:
+    - evaluate every eval_freq env steps over eval_episodes episodes.
+  - Logging/output:
+    - TensorBoard scalars: losses, rewards, epsilon, priority stats,
+      LFIW loss/accuracy, etc.
+    - Checkpoints every save_freq env steps.
+    - plot_results() can render training curves and priority stats into
+      plots/rmer_results.png or, when output_dir is provided, into
+      fixed/plots/rmer_results.png.
+
+
+5. MAJOR BUGS FOUND AND FIXED
+-----------------------------
+
+This project uncovered and fixed several subtle but important bugs.
+
+5.1 Epsilon-Decay Bug (Root Cause of Invalid RMER Results)
+
+Location:
+
+- phase1_baseline/dqn.py (old: update_epsilon() based on train_step).
+- phase1_baseline/train_baseline.py and phase3_rmer/train_rmer.py
+  (old: no env-step-based epsilon updates).
+
+Problem:
+
+- Config intended epsilon_decay_steps to be in env steps:
+  - e.g. epsilon_decay_steps=100_000 was meant as “epsilon reaches
+    0.05 by 100k env steps.”
+- Code used train_step (number of gradient updates) inside update():
+  - With train_freq=4, 200k env steps ⇒ 50k updates.
+  - So epsilon_decay_steps=100_000 behaved like “100k updates,” which
+    never completed within 200k env steps.
+- Result:
+  - For seeds 5–9, epsilon remained ≈0.53 at the end of 200k steps
+    (instead of decaying to 0.05).
+  - Seeds 0–4 (run earlier that day) had a different epsilon behavior
+    (env-step-based), reaching 0.05 around ~41k env steps.
+  - This mismatch made early vs late seeds incomparable and invalidated
+    the initial RMER vs TD-only comparisons.
+
+Fix:
+
+- DQN:
+  - Added decay_epsilon_by_env_step(self, env_step) in dqn.py:
+    - Computes epsilon as a function of env_step / epsilon_decay_steps.
+  - Removed epsilon updates from update(): epsilon is no longer tied to
+    train_step or gradient updates.
+- Trainers:
+  - phase1_baseline/train_baseline.py and phase3_rmer/train_rmer.py
+    now call:
+
+      agent.decay_epsilon_by_env_step(step)
+
+    at every env step before acting.
+- Config:
+  - epsilon_decay_steps set to 20_000 (10% of total 200k env steps).
+
+Outcome:
+
+- After the fix, epsilon follows a clean, deterministic schedule:
+  - 1.0 → 0.05 over the first 20,000 env steps.
+  - Epsilon reaches 0.05 by ~20k for every run and stays there.
+- New runs for seeds 0–9 (both td_only and full_rmer) are directly
+  comparable and free of the previous inconsistent exploration bug.
+
+5.2 RMERBuffer / TCE Indexing Bug (Critical for Q-Accuracy)
+
+Location:
+
+- phase3_rmer/rmer_buffer.py and phase2_components/tce.py.
+
+Original design:
+
+- Buffer was a deque with maxlen=capacity.
+- Each push used trans_id = len(self.buffer) and registered that id
+  with DistanceTracker.
+- Sampling returned buffer indices [0..len-1].
+- update_priorities called distance_tracker.get_distances(indices),
+  treating buffer indices as transition IDs.
+
+Problems:
+
+1) Deque index / transition_id mismatch after wrap:
+   - When the deque is full and a new element is appended, the oldest
+     element is dropped from the left, and indices shift:
+       - old buffer: [T0, T1, ..., T(cap-1)]
+       - after append: [T1, T2, ..., T(cap-1), T_new]
+   - But distances in DistanceTracker are keyed by trans_id, which
+     never reuses old ids.
+   - Passing indices (0..n-1) as transition IDs meant that once the
+     buffer wrapped, TCE distances became incorrect for almost all
+     items.
+
+2) Priorities misaligned with buffer contents:
+   - priorities was a fixed numpy array indexed by buffer index.
+   - When the deque dropped an element from the left, all buffer
+     indices shifted, but priorities were not shifted.
+   - So priorities[i] no longer matched buffer[i] after wrap.
+
+Fix:
+
+- Switched to a proper circular buffer:
+  - buffer: list of size capacity.
+  - trans_ids: numpy array of size capacity storing a transition_id
+    per slot.
+  - priorities: numpy array of size capacity aligned with buffer.
+  - _write_pos: index where the next push will write.
+  - _size: number of valid elements (<= capacity).
+  - _next_trans_id: monotonically increasing counter to assign IDs.
+- push:
+  - Writes transition at buffer[_write_pos].
+  - Sets trans_ids[_write_pos] = new trans_id.
+  - Sets priorities[_write_pos] = 1.0.
+  - Registers trans_id with DistanceTracker.
+  - Advances _write_pos (mod capacity); _size = min(_size+1, capacity).
+- sample:
+  - n = _size; sample indices in [0, n-1].
+  - These indices are stable slot indices; buffer[i], trans_ids[i],
+    priorities[i] all refer to the same slot.
+- update_priorities:
+  - For sampled indices, compute HTD, LFIW, TCE.
+  - For TCE distances: use trans_ids[indices] and call
+    get_distances(trans_ids), not indices.
+  - Update priorities[indices] accordingly.
+- get_fast_slow_indices(fast_ratio) for LFIW:
+  - When n < capacity:
+    - Fast = indices [split, n-1], slow = [0, split-1] (simple).
+  - When n == capacity:
+    - Oldest logical position is at _write_pos; we map “age order”
+      to physical indices using (_write_pos + i) % capacity.
+    - This preserves “newest 20%” vs “oldest 80%” semantics.
+
+Outcome:
+
+- TCE distances now refer to the correct transition IDs even after
+  many wraps.
+- Priorities remain aligned with transitions.
+- LFIW’s notion of fast vs slow is truly age-based.
+
+5.3 TCE Progress (Update Steps vs Env Steps)
+
+Original issue:
+
+- TCEComputer.step() incremented current_step by 1 for every call.
+- step() was called from RMERBuffer.step(), which was only invoked
+  once per gradient update (i.e., every train_freq env steps).
+- But total_steps for TCE was in env steps (e.g. 200,000).
+- Thus, progress = current_step / total_steps had a unit mismatch
+  and never reached 1.0 within training (e.g. current_step ~50k
+  updates / 200k env steps => 0.25).
+
+Fix:
+
+- TCEComputer.step(env_step=None) now accepts env_step:
+  - If env_step is provided, sets current_step = env_step.
+  - Otherwise, increments current_step by 1 (backward-compatible).
+- RMERBuffer.step(env_step) passes env_step to TCEComputer.step.
+- RMERAgent.update(env_step) calls replay_buffer.step(env_step).
+- RMERTrainer passes env_step=step when calling agent.update.
+
+Outcome:
+
+- TCE’s adaptive bounds (b1, b2) now evolve according to env progress:
+  - progress = env_step / total_steps.
+  - At the end of 200k steps, progress ≈ 1.0, as intended.
+
+5.4 Agent total_steps vs Training Length
+
+Issue:
+
+- RMERAgent and RMERBuffer received total_steps from config at
+  construction time (e.g. 200,000).
+- If train_rmer.py was run with --steps 500000, train(total_steps)
+  would run 500k env steps while TCE and any time-based logic still
+  assumed 200k.
+
+Fix:
+
+- RMERAgent.set_total_steps(total_steps) was added:
+  - Updates replay_buffer.total_steps and
+    replay_buffer.tce_computer.total_steps.
+- RMERTrainer.train(total_steps) now:
+  - If total_steps is None, uses config['total_steps'].
+  - Otherwise sets config['total_steps'] = total_steps and calls
+    agent.set_total_steps(total_steps).
+
+Outcome:
+
+- Time-based logic (TCE bounds, etc.) stays consistent with the
+  actual training horizon.
+
+
+6. EXPERIMENTS AND RESULTS
+--------------------------
+
+There are three main “generations” of results:
+
+6.1 Early, Invalid Results (Before Epsilon Fix)
+
+- Location:
+  - runs_archive_invalid/ and earlier comparison scripts.
+- Problem:
+  - Seeds 0–4 and 5–9 used different epsilon decay behavior (env-step
+    vs update-step).
+  - Some comparisons used 5 vs 10 seeds (unbalanced), which further
+    reduced statistical power.
+- Symptom:
+  - Epsilon curves:
+    - Seed 0: reached 0.05 by ~41,000 env steps.
+    - Seed 5: never reached 0.05, stuck at ~0.53 at the end.
+  - Some early analyses suggested that full_rmer was dramatically
+    better (mean -27 vs td_only mean -75, etc.) but those numbers
+    were confounded by exploration schedules and unbalanced seeds.
+- Resolution:
+  - Marked as invalid; directory runs_archive_invalid stores those
+    event files for reference but they are not used for any final
+    claims.
+
+6.2 Post-Epsilon-Fix Results (td_only vs full_rmer, 10 vs 10)
+
+Inputs:
+
+- td_only_results.json:
+  - seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  - rewards: [-1.58, 32.82, -43.58, 7.36, -22.98,
+              -77.52, -36.16, -47.02, 105.31, -103.70]
+
+- full_rmer_results.json:
+  - seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  - rewards:
+      [-53.29, -34.62, -45.38, -35.32, -35.46,
+       -21.51, 86.14, -98.89, -23.40, -75.46]
+
+Aggregate (from DEEP_ANALYSIS_EPSILON_AND_RESULTS.md):
+
+- td_only:
+  - mean reward: -18.70
+  - std reward:  59.10
+- full_rmer:
+  - mean reward: -33.72
+  - std reward:  48.46
+- Difference:
+  - td_only is +15 points better on average.
+  - p-value ≈ 0.54 (not statistically significant).
+  - Cohen’s d ≈ -0.28 (small effect, favoring td_only).
+
+Interpretation:
+
+- With a correct, consistent epsilon schedule and equal seeds (10 vs
+  10), full RMER does not significantly outperform TD-only on
+  LunarLander-v2 at 200k steps.
+- TD-only has slightly better mean performance, while full RMER has
+  slightly lower variance.
+- This is effectively a null result: no strong evidence that
+  full_rmer is superior to td_only under this particular setup.
+
+6.3 Ablation Study Results (from run_ablations.py)
+
+- Location:
+  - results/ablation_LunarLander-v2_20260208_025251/ablation_results.json
+  - Plots under results/.../plots/ablation_study.png and
+    learning_curves.png.
+- Study:
+  - Configs: uniform, td_only, lfiw_only, tce_only, td_lfiw, td_tce,
+    lfiw_tce, full_rmer.
+  - Each configuration: multiple seeds, 100k or 200k steps (see
+    script arguments).
+- High-level qualitative observations (not exhaustively repeated here):
+  - Uniform replay is generally worse than prioritization-based
+    methods.
+  - Adding individual components changes mean and variance; full RMER
+    tends to reduce variance but does not necessarily improve mean
+    across all seeds and budgets.
+
+6.4 Baseline Comparisons (CartPole, LunarLander-v2, LunarLander-v3)
+
+- Locations:
+  - results/comparison_CartPole-v1_20260206_185406/
+  - results/comparison_LunarLander-v2_20260207_135059/
+  - results/comparison_LunarLander-v3_20260207_115800/
+- Each directory contains:
+  - comparison_results.json: mean/std, mean_length, and full reward
+    distributions for multiple methods (e.g. Uniform Replay, TD-only,
+    full RMER).
+  - plots/comparison_learning_curves.png and comparison_table.png:
+    visual summaries.
+- Example (LunarLander-v2; from comparison_results.json):
+  - Uniform Replay: mean ~25.7, std ~86.5.
+  - RMER-based methods show different tradeoffs between mean return
+    and stability.
+
+6.5 Fixed Logic Experiments (Ongoing)
+
+- Script:
+
+    python experiments/run_fixed_experiments.py --env LunarLander-v2 --device cpu
+
+- Design:
+  - 200k steps per run.
+  - Seeds 0–9 (10 seeds) for td_only and full_rmer.
+  - Uses all fixes:
+    - Epsilon env-step decay.
+    - Circular buffer + correct trans_id for TCE.
+    - TCE progress in env steps.
+    - total_steps aligned with training horizon.
+    - LFIW fast/slow indices by age.
+  - Output:
+    - fixed/runs/: TensorBoard logs for each config and seed.
+    - fixed/checkpoints/: optional checkpoints.
+    - fixed/results/fixed_results_<timestamp>.json:
+      aggregated td_only vs full_rmer comparison (when run completes).
+      plus plots/ablation_study.png and learning_curves.png inside
+      fixed/results/plots/.
+- Status at time of this summary:
+  - Long runs have been initiated; some partial runs exist in
+    fixed/runs and fixed/checkpoints.
+  - When a run finishes successfully, fixed/results/ will contain the
+    JSON and plots described above.
+
+
+7. HOW TO REPRODUCE EVERYTHING
+------------------------------
+
+7.1 Setup
+
+1) Install dependencies:
+
+   cd /Users/saad/Desktop/regret_replay_RL
+   pip install -r requirements.txt
+
+2) (Optional) verify:
+
+   python -c "import torch; import gymnasium; print('OK')"
+
+7.2 Baseline DQN
+
+- Train:
+
+   python phase1_baseline/train_baseline.py --env LunarLander-v2 --seed 42 --steps 200000
+
+- View curves:
+
+   tensorboard --logdir runs/
+
+7.3 RMER (Single Run)
+
+- Train full RMER:
+
+   python phase3_rmer/train_rmer.py --env LunarLander-v2 --seed 42 --steps 200000
+
+- Plot:
+
+   (After training) the script calls trainer.plot_results(), which
+   saves plots/rmer_results.png.
+
+7.4 Ablation Study
+
+- Command:
+
+   python experiments/run_ablations.py --env LunarLander-v2 --seeds 5 --steps 100000
+
+- Outputs:
+  - results/ablation_LunarLander-v2_<timestamp>/ablation_results.json
+  - ablation_study.png and learning_curves.png in the plots subdir.
+
+7.5 Method Comparison
+
+- Command:
+
+   python experiments/compare_methods.py --env LunarLander-v2 --seeds 5 --steps 100000
+
+- Outputs:
+  - results/comparison_LunarLander-v2_<timestamp>/comparison_results.json
+  - comparison_learning_curves.png and comparison_table.png.
+
+7.6 Fixed-Logic Full Experiments (td_only vs full_rmer, 10 vs 10)
+
+- Command:
+
+   python experiments/run_fixed_experiments.py --env LunarLander-v2 --device cpu
+
+- Outputs (once complete):
+  - fixed/runs/: TensorBoard logs.
+  - fixed/checkpoints/: checkpoints for some steps.
+  - fixed/results/fixed_results_<timestamp>.json:
+    final comparison between td_only and full_rmer (newest, fully
+    consistent results).
+  - fixed/results/plots/ablation_study.png, learning_curves.png:
+    visual summaries.
+
+
+8. SUMMARY OF KEY CHANGES VS ORIGINAL IMPLEMENTATION
+----------------------------------------------------
+
+- Epsilon Handling:
+  - Before: epsilon depended on gradient update count (train_step),
+    epsilon_decay_steps misinterpreted as “updates”.
+  - After: epsilon driven strictly by env steps; schedule is
+    configurable and honored as intended.
+
+- RMERBuffer:
+  - Before: deque with fragile index semantics; TCE distances looked
+    up using buffer indices; priorities got out of sync after wrap.
+  - After: circular buffer with stable slot indices; separate
+    trans_ids array; correct mapping to DistanceTracker; age-based
+    fast/slow splits for LFIW.
+
+- TCE:
+  - Before: progress tracked in updates but total_steps in env steps;
+    adaptive bounds evolved too slowly.
+  - After: progress tracked in env steps; bounds match training
+    progress.
+
+- Agent total_steps:
+  - Before: fixed at config time; mismatched if steps arg changed.
+  - After: updated at the start of train(total_steps) via
+    set_total_steps.
+
+- Experiment Orchestration:
+  - Added run_fixed_experiments.py and fixed/ layout to store the
+    “gold standard” RMER vs TD-only comparison under consistent,
+    bug-fixed code.
+
+
+9. HIGH-LEVEL CONCLUSIONS
+-------------------------
+
+- The main *implementation bug* was a semantic mismatch between
+  epsilon_decay_steps (env steps in config) and its use in code
+  (updates). This affected half the seeds and invalidated initial
+  conclusions.
+
+- After fixing epsilon and auditing/fixing RMERBuffer and TCE details,
+  we re-ran 10 vs 10 seeds for td_only and full_rmer:
+  - No statistically significant advantage for full_rmer on
+    LunarLander-v2 at 200k steps.
+  - td_only slightly better on mean; full_rmer slightly more stable.
+
+- RMER remains theoretically sound and well-implemented in this repo,
+  but its empirical advantage is environment- and setup-dependent.
+  This replication shows that strong claims about RMER should be
+  backed by careful config validation, balanced sampling, and
+  statistically powered comparisons.
+
+This file should give you a complete narrative and technical summary
+of the current state of the project, the important code changes, and
+the main experimental findings.
+
